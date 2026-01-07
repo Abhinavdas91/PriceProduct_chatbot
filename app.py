@@ -42,46 +42,129 @@ def is_upc(text):
     return text.isdigit() and 8 <= len(text) <= 14
 
 
+def extract_countries(product):
+    tags = product.get("countries_tags")
+    if isinstance(tags, list) and tags:
+        return ", ".join(
+            c.replace("en:", "").replace("-", " ").title()
+            for c in tags
+        )
+
+    countries = product.get("countries")
+    if isinstance(countries, str) and countries.strip():
+        return countries
+
+    return "Not available"
+
+
 def estimate_price_eur(product):
     name = (product.get("product_name") or "").lower()
     categories = (product.get("categories") or "").lower()
     quantity = (product.get("quantity") or "").lower()
 
-    price = 2.5  # base EUR
+    # ----------------------------
+    # 1. BASE PRICE
+    # ----------------------------
+    price = 2.49  # realistic EU baseline
 
     if any(x in categories for x in ["chocolate", "snack", "biscuit"]):
-        price = 2.0
-    elif any(x in categories for x in ["drink", "beverage", "juice"]):
-        price = 1.5
-    elif any(x in categories for x in ["dairy", "milk", "cheese"]):
-        price = 2.2
+        price = 1.99
+    elif any(x in categories for x in ["drink", "beverage", "juice", "water"]):
+        price = 1.39
+    elif any(x in categories for x in ["dairy", "milk", "cheese", "yogurt"]):
+        price = 2.19
     elif any(x in categories for x in ["pet", "dog", "cat"]):
-        price = 4.0
+        price = 4.49
     elif any(x in categories for x in ["cosmetic", "beauty", "shampoo"]):
-        price = 3.8
-    elif "electronics" in categories:
-        price = 15.0
+        price = 3.49
+    elif any(x in categories for x in ["cleaning", "household"]):
+        price = 2.79
 
+    # ----------------------------
+    # 2. BRAND ADJUSTMENT
+    # ----------------------------
     premium_brands = ["coca", "nestle", "pepsi", "loreal", "nivea"]
-    if any(b in name for b in premium_brands):
-        price *= 1.4
+    budget_brands = ["lidl", "chef select", "freeway", "milbona"]
 
-    if any(x in quantity for x in ["1l", "kg", "1000"]):
-        price *= 1.3
+    if any(b in name for b in premium_brands):
+        price *= 1.35
+    elif any(b in name for b in budget_brands):
+        price *= 0.9
+
+    # ----------------------------
+    # 3. QUANTITY ADJUSTMENT
+    # ----------------------------
+    if any(x in quantity for x in ["1kg", "1000g", "1l", "1000ml"]):
+        price *= 1.25
+    elif any(x in quantity for x in ["500g", "500ml"]):
+        price *= 1.1
     elif any(x in quantity for x in ["200g", "250g", "150ml"]):
         price *= 0.85
+    elif any(x in quantity for x in ["100g", "100ml"]):
+        price *= 0.7
+
+    # ----------------------------
+    # 4. SPECIAL ATTRIBUTES
+    # ----------------------------
+    if any(x in name for x in ["organic", "bio"]):
+        price *= 1.25
+
+    # ----------------------------
+    # 5. ROUNDING (RETAIL STYLE)
+    # ----------------------------
+    price = round(price, 2)
+    if price > 1:
+        price = round(price - 0.01, 2)
 
     return f"~€{price:.2f}"
 
 
-def format_product(p, source, upc=None):
+# ----------------------------
+# CONFIDENCE WITH FACTORS
+# ----------------------------
+def calculate_confidence(product, query, is_upc_search=False):
+    score = 0
+    factors = {
+        "name": False,
+        "category": False,
+        "upc": False,
+        "country": False,
+    }
+
+    name = (product.get("product_name") or "").lower()
+    categories = (product.get("categories") or "").lower()
+
+    if query.lower() in name:
+        score += 50
+        factors["name"] = True
+
+    if categories:
+        score += 20
+        factors["category"] = True
+
+    if is_upc_search:
+        score += 40
+        factors["upc"] = True
+
+    if extract_countries(product) != "Not available":
+        score += 10
+        factors["country"] = True
+
+    return min(score, 100), factors
+
+
+def format_product(p, source, query=None, upc=None, is_upc_search=False):
+    confidence, factors = calculate_confidence(p, query or "", is_upc_search)
+
     return {
         "product_name": p.get("product_name") or "Unknown product",
         "upc": upc or p.get("code"),
         "image": p.get("image_url"),
         "price": estimate_price_eur(p),
-        "region": "EU (estimated)",
+        "countries": extract_countries(p),
         "source": source,
+        "confidence": confidence,
+        "confidence_factors": factors,
     }
 
 # ----------------------------
@@ -97,15 +180,16 @@ def search_products(query):
                 "search_simple": 1,
                 "action": "process",
                 "json": 1,
+                "page_size": 3,
             }
-            r = requests.get(src["search"], params=params, timeout=8)
+            r = requests.get(src["search"], params=params, timeout=6)
             if r.status_code != 200:
                 continue
 
-            for p in r.json().get("products", [])[:3]:
-                results.append(format_product(p, src["name"]))
+            for p in r.json().get("products", []):
+                results.append(format_product(p, src["name"], query=query))
         except Exception:
-            pass
+            continue
 
     return results
 
@@ -115,14 +199,21 @@ def get_product_by_upc(upc):
 
     for src in SOURCES:
         try:
-            r = requests.get(src["upc"].format(upc), timeout=8)
+            r = requests.get(src["upc"].format(upc), timeout=6)
             if r.status_code == 200 and r.json().get("status") == 1:
-                results.append(format_product(r.json()["product"], src["name"], upc))
+                results.append(
+                    format_product(
+                        r.json()["product"],
+                        src["name"],
+                        query=upc,
+                        upc=upc,
+                        is_upc_search=True,
+                    )
+                )
         except Exception:
-            pass
+            continue
 
     return results
-
 
 # ----------------------------
 # AUTH
@@ -143,7 +234,6 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
-
 # ----------------------------
 # UI
 # ----------------------------
@@ -152,7 +242,6 @@ def home():
     if not session.get("logged_in"):
         return redirect(url_for("login"))
     return render_template_string(CHAT_HTML)
-
 
 # ----------------------------
 # CHAT API
@@ -166,13 +255,8 @@ def chat():
     if not query:
         return jsonify({"results": []})
 
-    if is_upc(query):
-        results = get_product_by_upc(query)
-    else:
-        results = search_products(query)
-
+    results = get_product_by_upc(query) if is_upc(query) else search_products(query)
     return jsonify({"results": results})
-
 
 # ----------------------------
 # HTML
@@ -195,14 +279,15 @@ CHAT_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>LIDL Product Chatbot</title>
+<title>LIDL Product Chatbot 🤖 v2</title>
 <style>
 body { font-family: Arial; background:#f4f4f4; }
-.chat { width:520px; margin:30px auto; background:#fff; padding:16px; border-radius:8px; }
-.msg { margin-bottom:12px; }
+.chat { width:560px; margin:30px auto; background:#fff; padding:16px; border-radius:8px; }
+.msg { margin-bottom:14px; }
 .user { color:#1a73e8; }
 .bot { color:#188038; border-bottom:1px solid #eee; padding-bottom:10px; }
 img { max-width:120px; margin-top:6px; }
+
 .instructions {
   background:#f9fafb;
   border-left:4px solid #1a73e8;
@@ -210,42 +295,45 @@ img { max-width:120px; margin-top:6px; }
   margin-bottom:15px;
   font-size:14px;
 }
-.instructions a {
-  color:#1a73e8;
-  text-decoration:none;
+
+.conf { font-size:13px; }
+.info { cursor:pointer; color:#1a73e8; font-weight:bold; }
+
+.popup {
+  display:none;
+  position:absolute;
+  background:#fff;
+  border:1px solid #ccc;
+  padding:10px;
+  font-size:12px;
+  width:260px;
+  z-index:1000;
 }
-.instructions a:hover {
-  text-decoration:underline;
+
+.factor-on { color:#AB1818; font-weight:bold; }
+.factor-off { color:#999; }
+
+/* 🔴 CONFIDENCE COLOR */
+.confidence-red {
+  color: #d93025;
+  font-weight: bold;
 }
 </style>
 </head>
+
 <body>
 
 <div class="chat">
 <a href="/logout" style="float:right">Logout</a>
-<h3>LIDL Product Chatbot</h3>
+<h3>LIDL Product Chatbot 🤖 v2</h3>
 
 <div class="instructions">
-<b>Step 1:</b> Please refer the products from the official LIDL portfolios below:<br><br>
-
-• <a href="https://www.lidl.de/c/online-prospekte/s10005610" target="_blank">
-Germany – Online Prospekt
-</a><br>
-
-• <a href="https://www.lidl.cz/c/akcni-letak/s10008644" target="_blank">
-Czech Republic – Akční leták
-</a><br>
-
-• <a href="https://www.lidl.co.uk/c/online-leaflets/s10023175?utm_source=home-page&utm_medium=leaflets&utm_campaign=new-navigation" target="_blank">
-United Kingdom – Online Leaflets
-</a><br>
-
-• <a href="https://www.lidl.pl/c/nasze-gazetki/s10008614" target="_blank">
-Poland – Gazetki
-</a><br><br>
-
-<b>Step 2:</b> If the product is <u>not available</u> in the above portfolios,  
-please search using the chatbot below.
+<b>Step 1:</b> Refer the official LIDL product portfolios from below:<br><br>
+⭐ <a href="https://www.lidl.de/c/online-prospekte/s10005610" target="_blank">Germany </a>
+⭐ <a href="https://www.lidl.cz/c/akcni-letak/s10008644" target="_blank">Czech Republic</a>
+⭐ <a href="https://www.lidl.co.uk/c/online-leaflets/s10023175" target="_blank">United Kingdom</a>
+⭐ <a href="https://www.lidl.pl/c/nasze-gazetki/s10008614" target="_blank">Poland</a><br><br>
+<b>Step 2:</b> Search by product name or UPC if not found above.
 </div>
 
 <div id="chat"></div>
@@ -253,6 +341,8 @@ please search using the chatbot below.
 <input id="q" placeholder="Enter product name or UPC" style="width:75%">
 <button onclick="send()">Send</button>
 </div>
+
+<div id="popup" class="popup"></div>
 
 <script>
 function send(){
@@ -269,10 +359,7 @@ function send(){
   .then(r => r.json())
   .then(data => {
     if(data.results.length === 0){
-      chat.innerHTML += `<div class="msg bot">
-        Product not found.<br>
-        Please verify using LIDL portfolios above or refine your search.
-      </div>`;
+      chat.innerHTML += `<div class="msg bot">No product found.</div>`;
       return;
     }
 
@@ -282,14 +369,39 @@ function send(){
         <b>${p.product_name}</b><br>
         UPC: ${p.upc || "N/A"}<br>
         Estimated Price: ${p.price}<br>
-        Region: ${p.region}<br>
+        Countries where sold: ${p.countries}<br>
         Source: ${p.source}<br>
+        <div class="conf">
+          Confidence: <span class="confidence-red">${p.confidence}%</span>
+          <span class="info" onclick='togglePopup(event, ${JSON.stringify(p.confidence_factors)})'>ℹ️</span>
+        </div>
         ${p.image ? `<img src="${p.image}">` : ""}
       </div>`;
     });
   });
 
   document.getElementById("q").value = "";
+}
+
+function togglePopup(e, factors){
+  let p = document.getElementById("popup");
+
+  if (p.style.display === "block") {
+    p.style.display = "none";
+    return;
+  }
+
+  p.innerHTML = `
+    <b>Confidence score calculation</b><br><br>
+    <div class="${factors.name ? 'factor-on' : 'factor-off'}">• Product name match (50%)</div>
+    <div class="${factors.category ? 'factor-on' : 'factor-off'}">• Category relevance (20%)</div>
+    <div class="${factors.upc ? 'factor-on' : 'factor-off'}">• Exact UPC match (40%)</div>
+    <div class="${factors.country ? 'factor-on' : 'factor-off'}">• Country metadata present (10%)</div>
+  `;
+
+  p.style.display = "block";
+  p.style.top = (e.pageY + 10) + "px";
+  p.style.left = (e.pageX + 10) + "px";
 }
 </script>
 
