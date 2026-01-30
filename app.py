@@ -279,7 +279,7 @@ CHAT_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>LIDL Product Chatbot 🤖 v2</title>
+<title>Product Price Chatbot 🤖 v2</title>
 <style>
 body { font-family: Arial; background:#f4f4f4; }
 .chat { width:560px; margin:30px auto; background:#fff; padding:16px; border-radius:8px; }
@@ -325,7 +325,7 @@ img { max-width:120px; margin-top:6px; }
 
 <div class="chat">
 <a href="/logout" style="float:right">Logout</a>
-<h3>LIDL Product Chatbot 🤖 v2</h3>
+<h3>Product Price Chatbot 🤖 v2</h3>
 
 <div class="instructions">
 <b>Step 1:</b> Refer the official LIDL product portfolios from below:<br><br>
