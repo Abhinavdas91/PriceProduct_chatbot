@@ -1,417 +1,429 @@
+import streamlit as st
+import pandas as pd
+import math
+import sys
 import os
-import requests
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
 
-# ----------------------------
-# APP SETUP
-# ----------------------------
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "lidl123")
+# -------------------------------------------------------------
+# 1. PAGE CONFIGURATION & FORCE LIGHT THEME OVERRIDES
+# -------------------------------------------------------------
+st.set_page_config(
+    page_title="Everseen India Operations Calculator",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ----------------------------
-# DATA SOURCES
-# ----------------------------
-SOURCES = [
-    {
-        "name": "OpenFoodFacts",
-        "search": "https://world.openfoodfacts.org/cgi/search.pl",
-        "upc": "https://world.openfoodfacts.org/api/v0/product/{}.json",
-    },
-    {
-        "name": "OpenBeautyFacts",
-        "search": "https://world.openbeautyfacts.org/cgi/search.pl",
-        "upc": "https://world.openbeautyfacts.org/api/v0/product/{}.json",
-    },
-    {
-        "name": "OpenPetFoodFacts",
-        "search": "https://world.openpetfoodfacts.org/cgi/search.pl",
-        "upc": "https://world.openpetfoodfacts.org/api/v0/product/{}.json",
-    },
-    {
-        "name": "OpenProductsFacts",
-        "search": "https://world.openproductsfacts.org/cgi/search.pl",
-        "upc": "https://world.openproductsfacts.org/api/v0/product/{}.json",
-    },
-]
-
-# ----------------------------
-# HELPERS
-# ----------------------------
-def is_upc(text):
-    return text.isdigit() and 8 <= len(text) <= 14
-
-
-def extract_countries(product):
-    tags = product.get("countries_tags")
-    if isinstance(tags, list) and tags:
-        return ", ".join(
-            c.replace("en:", "").replace("-", " ").title()
-            for c in tags
-        )
-
-    countries = product.get("countries")
-    if isinstance(countries, str) and countries.strip():
-        return countries
-
-    return "Not available"
-
-
-def estimate_price_eur(product):
-    name = (product.get("product_name") or "").lower()
-    categories = (product.get("categories") or "").lower()
-    quantity = (product.get("quantity") or "").lower()
-
-    # ----------------------------
-    # 1. BASE PRICE
-    # ----------------------------
-    price = 2.49  # realistic EU baseline
-
-    if any(x in categories for x in ["chocolate", "snack", "biscuit"]):
-        price = 1.99
-    elif any(x in categories for x in ["drink", "beverage", "juice", "water"]):
-        price = 1.39
-    elif any(x in categories for x in ["dairy", "milk", "cheese", "yogurt"]):
-        price = 2.19
-    elif any(x in categories for x in ["pet", "dog", "cat"]):
-        price = 4.49
-    elif any(x in categories for x in ["cosmetic", "beauty", "shampoo"]):
-        price = 3.49
-    elif any(x in categories for x in ["cleaning", "household"]):
-        price = 2.79
-
-    # ----------------------------
-    # 2. BRAND ADJUSTMENT
-    # ----------------------------
-    premium_brands = ["coca", "nestle", "pepsi", "loreal", "nivea"]
-    budget_brands = ["lidl", "chef select", "freeway", "milbona"]
-
-    if any(b in name for b in premium_brands):
-        price *= 1.35
-    elif any(b in name for b in budget_brands):
-        price *= 0.9
-
-    # ----------------------------
-    # 3. QUANTITY ADJUSTMENT
-    # ----------------------------
-    if any(x in quantity for x in ["1kg", "1000g", "1l", "1000ml"]):
-        price *= 1.25
-    elif any(x in quantity for x in ["500g", "500ml"]):
-        price *= 1.1
-    elif any(x in quantity for x in ["200g", "250g", "150ml"]):
-        price *= 0.85
-    elif any(x in quantity for x in ["100g", "100ml"]):
-        price *= 0.7
-
-    # ----------------------------
-    # 4. SPECIAL ATTRIBUTES
-    # ----------------------------
-    if any(x in name for x in ["organic", "bio"]):
-        price *= 1.25
-
-    # ----------------------------
-    # 5. ROUNDING (RETAIL STYLE)
-    # ----------------------------
-    price = round(price, 2)
-    if price > 1:
-        price = round(price - 0.01, 2)
-
-    return f"~€{price:.2f}"
-
-
-# ----------------------------
-# CONFIDENCE WITH FACTORS
-# ----------------------------
-def calculate_confidence(product, query, is_upc_search=False):
-    score = 0
-    factors = {
-        "name": False,
-        "category": False,
-        "upc": False,
-        "country": False,
-    }
-
-    name = (product.get("product_name") or "").lower()
-    categories = (product.get("categories") or "").lower()
-
-    if query.lower() in name:
-        score += 50
-        factors["name"] = True
-
-    if categories:
-        score += 20
-        factors["category"] = True
-
-    if is_upc_search:
-        score += 40
-        factors["upc"] = True
-
-    if extract_countries(product) != "Not available":
-        score += 10
-        factors["country"] = True
-
-    return min(score, 100), factors
-
-
-def format_product(p, source, query=None, upc=None, is_upc_search=False):
-    confidence, factors = calculate_confidence(p, query or "", is_upc_search)
-
-    return {
-        "product_name": p.get("product_name") or "Unknown product",
-        "upc": upc or p.get("code"),
-        "image": p.get("image_url"),
-        "price": estimate_price_eur(p),
-        "countries": extract_countries(p),
-        "source": source,
-        "confidence": confidence,
-        "confidence_factors": factors,
-    }
-
-# ----------------------------
-# SEARCH LOGIC
-# ----------------------------
-def search_products(query):
-    results = []
-
-    for src in SOURCES:
-        try:
-            params = {
-                "search_terms": query,
-                "search_simple": 1,
-                "action": "process",
-                "json": 1,
-                "page_size": 3,
-            }
-            r = requests.get(src["search"], params=params, timeout=6)
-            if r.status_code != 200:
-                continue
-
-            for p in r.json().get("products", []):
-                results.append(format_product(p, src["name"], query=query))
-        except Exception:
-            continue
-
-    return results
-
-
-def get_product_by_upc(upc):
-    results = []
-
-    for src in SOURCES:
-        try:
-            r = requests.get(src["upc"].format(upc), timeout=6)
-            if r.status_code == 200 and r.json().get("status") == 1:
-                results.append(
-                    format_product(
-                        r.json()["product"],
-                        src["name"],
-                        query=upc,
-                        upc=upc,
-                        is_upc_search=True,
-                    )
-                )
-        except Exception:
-            continue
-
-    return results
-
-# ----------------------------
-# AUTH
-# ----------------------------
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error = ""
-    if request.method == "POST":
-        if request.form.get("password") == APP_PASSWORD:
-            session["logged_in"] = True
-            return redirect(url_for("home"))
-        error = "Invalid password"
-    return render_template_string(LOGIN_HTML, error=error)
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-# ----------------------------
-# UI
-# ----------------------------
-@app.route("/")
-def home():
-    if not session.get("logged_in"):
-        return redirect(url_for("login"))
-    return render_template_string(CHAT_HTML)
-
-# ----------------------------
-# CHAT API
-# ----------------------------
-@app.route("/chat", methods=["POST"])
-def chat():
-    if not session.get("logged_in"):
-        return jsonify({"error": "Unauthorized"}), 401
-
-    query = request.json.get("query", "").strip()
-    if not query:
-        return jsonify({"results": []})
-
-    results = get_product_by_upc(query) if is_upc(query) else search_products(query)
-    return jsonify({"results": results})
-
-# ----------------------------
-# HTML
-# ----------------------------
-LOGIN_HTML = """
-<!DOCTYPE html>
-<html>
-<body style="font-family:Arial">
-<h3>Login</h3>
-<form method="post">
-  <input type="password" name="password" placeholder="Password">
-  <button type="submit">Login</button>
-  <p style="color:red;">{{error}}</p>
-</form>
-</body>
-</html>
-"""
-
-CHAT_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Product Price Chatbot 🤖 v2</title>
+# Custom CSS styling to establish Everseen Indigo branding,
+# force Light Mode defaults globally, style input elements,
+# and construct elegant metrics cards that will NEVER truncate ("...").
+st.markdown("""
 <style>
-body { font-family: Arial; background:#f4f4f4; }
-.chat { width:560px; margin:30px auto; background:#fff; padding:16px; border-radius:8px; }
-.msg { margin-bottom:14px; }
-.user { color:#1a73e8; }
-.bot { color:#188038; border-bottom:1px solid #eee; padding-bottom:10px; }
-img { max-width:120px; margin-top:6px; }
-
-.instructions {
-  background:#f9fafb;
-  border-left:4px solid #1a73e8;
-  padding:10px;
-  margin-bottom:15px;
-  font-size:14px;
-}
-
-.conf { font-size:13px; }
-.info { cursor:pointer; color:#1a73e8; font-weight:bold; }
-
-.popup {
-  display:none;
-  position:absolute;
-  background:#fff;
-  border:1px solid #ccc;
-  padding:10px;
-  font-size:12px;
-  width:260px;
-  z-index:1000;
-}
-
-.factor-on { color:#AB1818; font-weight:bold; }
-.factor-off { color:#999; }
-
-/* 🔴 CONFIDENCE COLOR */
-.confidence-red {
-  color: #d93025;
-  font-weight: bold;
-}
-</style>
-</head>
-
-<body>
-
-<div class="chat">
-<a href="/logout" style="float:right">Logout</a>
-<h3>Product Price Chatbot 🤖 v2</h3>
-
-<div class="instructions">
-<b>Step 1:</b> Refer the official LIDL product portfolios from below:<br><br>
-⭐ <a href="https://www.lidl.de/c/online-prospekte/s10005610" target="_blank">Germany </a>
-⭐ <a href="https://www.lidl.cz/c/akcni-letak/s10008644" target="_blank">Czech Republic</a>
-⭐ <a href="https://www.lidl.co.uk/c/online-leaflets/s10023175" target="_blank">United Kingdom</a>
-⭐ <a href="https://www.lidl.pl/c/nasze-gazetki/s10008614" target="_blank">Poland</a><br><br>
-<b>Step 2:</b> Search by product name or UPC if not found above.
-</div>
-
-<div id="chat"></div>
-
-<input id="q" placeholder="Enter product name or UPC" style="width:75%">
-<button onclick="send()">Send</button>
-</div>
-
-<div id="popup" class="popup"></div>
-
-<script>
-function send(){
-  let q = document.getElementById("q").value;
-  if(!q) return;
-
-  chat.innerHTML += `<div class="msg user"><b>You:</b> ${q}</div>`;
-
-  fetch("/chat", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({query: q})
-  })
-  .then(r => r.json())
-  .then(data => {
-    if(data.results.length === 0){
-      chat.innerHTML += `<div class="msg bot">No product found.</div>`;
-      return;
+    /* 1. Force Clean Light Theme Background & Fonts Globally */
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+        background-color: #FAFAFC !important;
+        color: #1E0B3E !important;
+        font-family: 'Inter', -apple-system, sans-serif !important;
     }
 
-    data.results.forEach(p => {
-      chat.innerHTML += `
-      <div class="msg bot">
-        <b>${p.product_name}</b><br>
-        UPC: ${p.upc || "N/A"}<br>
-        Estimated Price: ${p.price}<br>
-        Countries where sold: ${p.countries}<br>
-        Source: ${p.source}<br>
-        <div class="conf">
-          Confidence: <span class="confidence-red">${p.confidence}%</span>
-          <span class="info" onclick='togglePopup(event, ${JSON.stringify(p.confidence_factors)})'>ℹ️</span>
+    /* 2. Everseen Title Logo Styling */
+    .everseen-logo {
+        font-size: 3.2rem;
+        font-weight: 800;
+        color: #241571;
+        letter-spacing: -1.5px;
+        margin-bottom: -5px;
+        font-family: 'Inter', -apple-system, sans-serif !important;
+    }
+    .everseen-sub {
+        font-size: 1.1rem;
+        color: #7A70A6;
+        margin-bottom: 25px;
+        font-family: 'Inter', -apple-system, sans-serif !important;
+    }
+
+    /* 3. Section Headings (Everseen Indigo #241571) */
+    .section-header {
+        color: #241571 !important;
+        font-weight: 700 !important;
+        font-size: 1.4rem !important;
+        margin-top: 10px;
+        margin-bottom: 15px;
+        border-bottom: 2px solid #EAEAF0;
+        padding-bottom: 6px;
+        font-family: 'Inter', -apple-system, sans-serif !important;
+    }
+
+    /* 4. Streamlit Default Input Styling Overrides to match Everseen Theme */
+    div[data-baseweb="select"] {
+        border-color: #E2E8F0 !important;
+    }
+    div[data-baseweb="select"] * {
+        color: #241571 !important; /* Force interactive dropdown texts and chevrons */
+        font-weight: 600 !important;
+    }
+    div[data-testid="stExpander"] {
+        background-color: #FFFFFF !important;
+        border: 1px solid #E6E6ED !important;
+        border-radius: 8px !important;
+        box-shadow: 0 2px 4px rgba(36, 21, 113, 0.04) !important;
+    }
+    div[data-testid="stExpander"] [role="button"] {
+        background-color: #F8FAFC !important; /* Header light background shade */
+        color: #241571 !important;
+        font-weight: 700 !important;
+    }
+
+    /* 5. Custom Metric Cards (Responsive, Anti-Ellipsis Wrap) */
+    .everseen-metric-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        margin-top: 15px;
+        margin-bottom: 20px;
+    }
+    .everseen-card {
+        flex: 1;
+        min-width: 220px;
+        background: #FFFFFF;
+        border-left: 5px solid #241571;
+        border-radius: 8px;
+        padding: 18px 20px;
+        box-shadow: 0 4px 12px rgba(36, 21, 113, 0.05);
+        border-top: 1px solid #EAEAF0;
+        border-right: 1px solid #EAEAF0;
+        border-bottom: 1px solid #EAEAF0;
+    }
+    .everseen-cost-gradient-card {
+        flex: 1;
+        min-width: 220px;
+        background: linear-gradient(135deg, #241571 0%, #4E54E5 50%, #D946EF 100%);
+        border-radius: 8px;
+        padding: 18px 20px;
+        box-shadow: 0 6px 16px rgba(36, 21, 113, 0.15);
+        color: #FFFFFF !important;
+    }
+    .card-label {
+        font-size: 0.85rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+    .everseen-card .card-label {
+        color: #6B7280;
+    }
+    .everseen-cost-gradient-card .card-label {
+        color: rgba(255, 255, 255, 0.85);
+    }
+    .card-val {
+        font-size: 1.85rem;
+        font-weight: 800;
+        line-height: 1.15;
+        white-space: normal !important; /* Allows natural wrapping */
+        word-break: break-word !important; /* Forces break on word boundaries */
+    }
+    .everseen-card .card-val {
+        color: #1E0B3E;
+    }
+    .everseen-cost-gradient-card .card-val {
+        color: #FFFFFF;
+    }
+    .card-desc {
+        font-size: 0.8rem;
+        margin-top: 6px;
+    }
+    .everseen-card .card-desc {
+        color: #9CA3AF;
+    }
+    .everseen-cost-gradient-card .card-desc {
+        color: rgba(255, 255, 255, 0.75);
+    }
+
+    /* 6. Custom Info banner style */
+    .everseen-info-box {
+        background-color: #F5F3FF;
+        border: 1px solid #DDD6FE;
+        border-radius: 8px;
+        padding: 15px;
+        margin-top: 15px;
+        margin-bottom: 15px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------------------------------------------------
+# 2. DATA DICTIONARIES (SIMPLIFIED BACKEND BASELINE)
+# -------------------------------------------------------------
+# Maps Team to Processes
+TEAM_MAPPING = {
+    "Data & Reporting": ["Recall", "SPM"],
+    "Annotations": [
+        "Image-Fresh Annotations", 
+        "Image-ReAnnotation", 
+        "Video- Evercheck", 
+        "Video- NextGen"
+    ],
+    "Tech Support (L1)": ["L1 Support Engineers"]
+}
+
+# Default items per hour (Baseline values)
+DEFAULT_HOURLY_RATES = {
+    "Recall": 35,
+    "SPM": 21,
+    "Image-Fresh Annotations": 11,
+    "Image-ReAnnotation": 43,
+    "Video- Evercheck": 4,
+    "Video- NextGen": 5,
+    "L1 Support Engineers": 4
+}
+
+# Cost per single item (in Euros)
+COST_MAPPING = {
+    "Recall": 0.06,
+    "SPM": 0.10,
+    "Image-Fresh Annotations": 0.19,
+    "Image-ReAnnotation": 0.05,
+    "Video- Evercheck": 0.51,
+    "Video- NextGen": 0.43,
+    "L1 Support Engineers": 0.20
+}
+
+# Standard productive operating hours multiplier to calculate Items/Day
+# Regular tasks have 7 hours of productive work; L1 Tech Support has 21 hours
+MULTIPLIER_MAPPING = {
+    "Recall": 7,
+    "SPM": 7,
+    "Image-Fresh Annotations": 7,
+    "Image-ReAnnotation": 7,
+    "Video- Evercheck": 7,
+    "Video- NextGen": 7,
+    "L1 Support Engineers": 21
+}
+
+# Assumed Unit input labels based on selected Process (Process-Specific)
+UNIT_MAPPING = {
+    "Recall": "Non-Alerted Transactions",
+    "SPM": "Alerted Transactions",
+    "Image-Fresh Annotations": "Images",
+    "Image-ReAnnotation": "Images",
+    "Video- Evercheck": "Videos",
+    "Video- NextGen": "Videos",
+    "L1 Support Engineers": "L1 Tickets"
+}
+
+# -------------------------------------------------------------
+# 3. HEADER & LOGO
+# -------------------------------------------------------------
+st.markdown('<div class="everseen-logo">everseen</div>', unsafe_allow_html=True)
+st.markdown('<div class="everseen-sub">India Operations Cost & Effort Capacity Planner</div>', unsafe_allow_html=True)
+
+# -------------------------------------------------------------
+# 4. EDITABLE OPERATIONAL DISCLAIMER
+# -------------------------------------------------------------
+with st.expander("📝 Operational Baseline Disclaimer (Editable)", expanded=True):
+    st.markdown(
+        "Modify the baseline **Items/Hour** metrics below directly in the table to dynamically refactor calculators across the workspace."
+    )
+
+    # Initialize editable dataframe in session state
+    if "editable_db" not in st.session_state:
+        default_df = pd.DataFrame([
+            {"Process": proc, "Items/Hour": rate}
+            for proc, rate in DEFAULT_HOURLY_RATES.items()
+        ])
+        st.session_state.editable_db = default_df
+
+    # Render editable table
+    edited_df = st.data_editor(
+        st.session_state.editable_db,
+        key="baseline_editor",
+        hide_index=True,
+    )
+    st.session_state.editable_db = edited_df
+
+    st.markdown(
+        "*Note: items per hour are calculated for 7hr efforts after removing data allocation and breaks (21hrs for L1 Support)*",
+        help="Adjusting these rates automatically updates the dependent target workloads (Items/Day) used to estimate effort timelines."
+    )
+
+# -------------------------------------------------------------
+# 5. DYNAMIC MAP INTERPRETATION FROM USER EDITS
+# -------------------------------------------------------------
+current_rates = {}
+for idx, row in edited_df.iterrows():
+    current_rates[row["Process"]] = int(row["Items/Hour"]) if pd.notna(row["Items/Hour"]) else 1
+
+# -------------------------------------------------------------
+# 6. STEP-BY-STEP CONFIGURATION & LAYOUT
+# -------------------------------------------------------------
+st.markdown('<div class="section-header">📋 Step-by-Step Configuration</div>', unsafe_allow_html=True)
+
+col_input, col_results = st.columns(2, gap="large")
+
+with col_input:
+    # Step 1: Team Dropdown
+    selected_team = st.selectbox(
+        "1. Select Team / Department",
+        options=list(TEAM_MAPPING.keys()),
+        index=0
+    )
+
+    # Step 2: Dynamic Process Dropdown
+    available_processes = TEAM_MAPPING[selected_team]
+    selected_process = st.selectbox(
+        "2. Select Process",
+        options=available_processes,
+        index=0
+    )
+
+    # Step 3: Total Available FTEs
+    available_fte = st.number_input(
+        "3. Total Available FTEs",
+        min_value=1,
+        value=5,
+        step=1,
+        help="Input the active headcount size allocated to this process backlog."
+    )
+
+    # Step 4: Volume Input (Context-aware labels from selected process)
+    assumed_unit = UNIT_MAPPING[selected_process]
+    item_volume = st.number_input(
+        f"4. Total Volume to Process (Assumed Unit: {assumed_unit})",
+        min_value=1,
+        value=5000,
+        step=100,
+        help="Total task volume requiring active processing."
+    )
+
+    # Optional Side Settings (Conversion Currency Rates)
+    st.markdown("---")
+    eur_to_inr_rate = st.number_input(
+        "EUR (€) to INR (₹) Exchange Rate",
+        min_value=1.0,
+        value=90.0,
+        step=0.5,
+        help="Set the active operational currency exchange rate."
+    )
+
+# -------------------------------------------------------------
+# 7. METRICS & ENGINE CALCULATIONS (DECIMAL-FREE TIMELINES)
+# -------------------------------------------------------------
+# Retrieve dynamically edited operational parameters
+hourly_rate = current_rates[selected_process]
+productive_hours = MULTIPLIER_MAPPING[selected_process]
+items_per_day = hourly_rate * productive_hours  # Target Items/Day
+unit_cost_eur = COST_MAPPING[selected_process]
+
+# Projections Engine
+total_cost_eur = item_volume * unit_cost_eur
+total_cost_inr = total_cost_eur * eur_to_inr_rate
+
+effort_hours = int(round(item_volume / hourly_rate)) if hourly_rate > 0 else 0
+fte_days_required = int(round(item_volume / items_per_day)) if items_per_day > 0 else 0
+
+# Timeline Projections - CEIL ROUNDING FOR ETA WORKING DAYS
+# Utilizes math.ceil to force-round up partial days to the next full working day
+eta_days = int(math.ceil(fte_days_required / available_fte)) if available_fte > 0 else 0
+
+# -------------------------------------------------------------
+# 8. PRESENT RESULTS (PREMIUM VISUAL METRICS)
+# -------------------------------------------------------------
+with col_results:
+    st.markdown('<div class="section-header">📊 Operational & Schedule Projections</div>', unsafe_allow_html=True)
+
+    # HTML Row 1: Timeline Projections
+    st.markdown(f"""
+    <div class="everseen-metric-row">
+        <div class="everseen-card">
+            <div class="card-label">
+                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                Estimated Delivery ETA
+            </div>
+            <div class="card-val">{eta_days:,} Working Days</div>
+            <div class="card-desc">Based on {available_fte:,} assigned FTEs (rounded up to next full day)</div>
         </div>
-        ${p.image ? `<img src="${p.image}">` : ""}
-      </div>`;
-    });
-  });
+        <div class="everseen-card">
+            <div class="card-label">
+                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                Total Required Effort
+            </div>
+            <div class="card-val">{fte_days_required:,} FTE-Days</div>
+            <div class="card-desc">Equivalent to {effort_hours:,} total productive hours</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-  document.getElementById("q").value = "";
-}
+    # HTML Row 2: Budget Projections
+    st.markdown(f"""
+    <div class="everseen-metric-row">
+        <div class="everseen-cost-gradient-card">
+            <div class="card-label">
+                <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                Total Estimated Cost
+            </div>
+            <div class="card-val">€ {total_cost_eur:,.2f}</div>
+            <div class="card-desc">₹ {total_cost_inr:,.2f} (approx. equivalent)</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-function togglePopup(e, factors){
-  let p = document.getElementById("popup");
+    # Details Breakdown Table
+    st.markdown("### Detailed Process Metrics")
+    breakdown_data = {
+        "Configuration Metric": [
+            "Department Name", 
+            "Target Process Flow", 
+            "Target Item Volume", 
+            "Calculated Items/Day Target", 
+            "Unit Operational Cost"
+        ],
+        "Active Values": [
+            str(selected_team),
+            str(selected_process),
+            f"{item_volume:,} {assumed_unit}",
+            f"{items_per_day:,} items",
+            f"€ {unit_cost_eur:.2f} per unit"
+        ]
+    }
+    breakdown_df = pd.DataFrame(breakdown_data)
+    st.dataframe(breakdown_df, hide_index=True)
 
-  if (p.style.display === "block") {
-    p.style.display = "none";
-    return;
-  }
+    # Instant CSV Exporter
+    csv_export_df = pd.DataFrame([{
+        "Team": selected_team,
+        "Process": selected_process,
+        "Assigned_FTE": available_fte,
+        "Target_Volume": item_volume,
+        "Items_Per_Hour_Edited": hourly_rate,
+        "Calculated_Items_Per_Day": items_per_day,
+        "Productive_Hours_Required": effort_hours,
+        "Total_FTE_Days_Required": fte_days_required,
+        "Calculated_ETA_Working_Days": eta_days,
+        "Total_Cost_EUR": round(total_cost_eur, 2),
+        "Total_Cost_INR": round(total_cost_inr, 2)
+    }])
 
-  p.innerHTML = `
-    <b>Confidence score calculation</b><br><br>
-    <div class="${factors.name ? 'factor-on' : 'factor-off'}">• Product name match (50%)</div>
-    <div class="${factors.category ? 'factor-on' : 'factor-off'}">• Category relevance (20%)</div>
-    <div class="${factors.upc ? 'factor-on' : 'factor-off'}">• Exact UPC match (40%)</div>
-    <div class="${factors.country ? 'factor-on' : 'factor-off'}">• Country metadata present (10%)</div>
-  `;
+    csv_bytes = csv_export_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Export Calculation Summary (CSV)",
+        data=csv_bytes,
+        file_name=f"everseen_ops_estimate_{selected_process.lower().replace(' ', '_')}.csv",
+        mime="text/csv",
+    )
 
-  p.style.display = "block";
-  p.style.top = (e.pageY + 10) + "px";
-  p.style.left = (e.pageX + 10) + "px";
-}
-</script>
-
-</body>
-</html>
-"""
-
-# ----------------------------
-# START
-# ----------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# -------------------------------------------------------------
+# 9. PYCHARM LOCAL PLAYBACK ENTRYPOINT (SAFE SHIELD CHECK)
+# -------------------------------------------------------------
+if __name__ == '__main__':
+    # Safeguards against double-boot runtime exceptions in Streamlit
+    if not st.runtime.exists():
+        try:
+            from streamlit.web import cli as stcli
+            sys.argv = ["streamlit", "run", __file__]
+            sys.exit(stcli.main())
+        except ImportError:
+            pass
