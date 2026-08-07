@@ -1,6 +1,7 @@
 import os
 import requests
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+import concurrent.futures
 
 # ----------------------------
 # APP SETUP
@@ -87,41 +88,44 @@ def format_product(p, source, upc=None):
 # ----------------------------
 # SEARCH LOGIC
 # ----------------------------
+def fetch_search_results(src, query):
+    """Fetches search results from a single source."""
+    try:
+        params = {
+            "search_terms": query,
+            "search_simple": 1,
+            "action": "process",
+            "json": 1,
+        }
+        r = requests.get(src["search"], params=params, timeout=5)
+        if r.status_code == 200:
+            return [format_product(p, src["name"]) for p in r.json().get("products", [])[:7]]
+    except Exception:
+        pass
+    return []
+
 def search_products(query):
+    """Searches for products across all sources concurrently."""
     results = []
-
-    for src in SOURCES:
-        try:
-            params = {
-                "search_terms": query,
-                "search_simple": 1,
-                "action": "process",
-                "json": 1,
-            }
-            r = requests.get(src["search"], params=params, timeout=8)
-            if r.status_code != 200:
-                continue
-
-            for p in r.json().get("products", [])[:3]:
-                results.append(format_product(p, src["name"]))
-        except Exception:
-            pass
-
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(SOURCES)) as executor:
+        future_to_source = {executor.submit(fetch_search_results, src, query): src for src in SOURCES}
+        for future in concurrent.futures.as_completed(future_to_source):
+            try:
+                results.extend(future.result())
+            except Exception:
+                pass
     return results
-
 
 def get_product_by_upc(upc):
-    results = []
-
+    """Searches for a product by UPC across all sources sequentially until found."""
     for src in SOURCES:
         try:
-            r = requests.get(src["upc"].format(upc), timeout=8)
+            r = requests.get(src["upc"].format(upc), timeout=5)
             if r.status_code == 200 and r.json().get("status") == 1:
-                results.append(format_product(r.json()["product"], src["name"], upc))
+                return [format_product(r.json()["product"], src["name"], upc)]
         except Exception:
             pass
-
-    return results
+    return []
 
 
 # ----------------------------
@@ -195,14 +199,14 @@ CHAT_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>LIDL Product Chatbot</title>
+<title>Product Price Bot</title>
 <style>
 body { font-family: Arial; background:#f4f4f4; }
 .chat { width:520px; margin:30px auto; background:#fff; padding:16px; border-radius:8px; }
 .msg { margin-bottom:12px; }
 .user { color:#1a73e8; }
 .bot { color:#188038; border-bottom:1px solid #eee; padding-bottom:10px; }
-img { max-width:120px; margin-top:6px; }
+img { max-width:120px; margin-top:6px; border-radius:4px; }
 .instructions {
   background:#f9fafb;
   border-left:4px solid #1a73e8;
@@ -210,42 +214,16 @@ img { max-width:120px; margin-top:6px; }
   margin-bottom:15px;
   font-size:14px;
 }
-.instructions a {
-  color:#1a73e8;
-  text-decoration:none;
-}
-.instructions a:hover {
-  text-decoration:underline;
-}
 </style>
 </head>
 <body>
 
 <div class="chat">
 <a href="/logout" style="float:right">Logout</a>
-<h3>LIDL Product Chatbot</h3>
+<h3>Product Price Bot</h3>
 
 <div class="instructions">
-<b>Step 1:</b> Please refer the products from the official LIDL portfolios below:<br><br>
-
-• <a href="https://www.lidl.de/c/online-prospekte/s10005610" target="_blank">
-Germany – Online Prospekt
-</a><br>
-
-• <a href="https://www.lidl.cz/c/akcni-letak/s10008644" target="_blank">
-Czech Republic – Akční leták
-</a><br>
-
-• <a href="https://www.lidl.co.uk/c/online-leaflets/s10023175?utm_source=home-page&utm_medium=leaflets&utm_campaign=new-navigation" target="_blank">
-United Kingdom – Online Leaflets
-</a><br>
-
-• <a href="https://www.lidl.pl/c/nasze-gazetki/s10008614" target="_blank">
-Poland – Gazetki
-</a><br><br>
-
-<b>Step 2:</b> If the product is <u>not available</u> in the above portfolios,  
-please search using the chatbot below.
+  <b>Hint:</b> You can search for a product by its name or by its UPC/barcode number.
 </div>
 
 <div id="chat"></div>
@@ -259,7 +237,9 @@ function send(){
   let q = document.getElementById("q").value;
   if(!q) return;
 
+  let chat = document.getElementById("chat");
   chat.innerHTML += `<div class="msg user"><b>You:</b> ${q}</div>`;
+  document.getElementById("q").value = "";
 
   fetch("/chat", {
     method: "POST",
@@ -270,8 +250,8 @@ function send(){
   .then(data => {
     if(data.results.length === 0){
       chat.innerHTML += `<div class="msg bot">
-        Product not found.<br>
-        Please verify using LIDL portfolios above or refine your search.
+        <b>Product not found.</b><br>
+        Please try a different product name or UPC.
       </div>`;
       return;
     }
@@ -287,10 +267,16 @@ function send(){
         ${p.image ? `<img src="${p.image}">` : ""}
       </div>`;
     });
+    chat.scrollTop = chat.scrollHeight;
   });
-
-  document.getElementById("q").value = "";
 }
+
+// Allow sending with Enter key
+document.getElementById("q").addEventListener("keyup", function(event) {
+    if (event.key === "Enter") {
+        send();
+    }
+});
 </script>
 
 </body>
